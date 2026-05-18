@@ -124,6 +124,19 @@ const TripSchema = new mongoose.Schema({
 
 const Trip = mongoose.model("Trip", TripSchema);
 
+/* ===================== SIMPLE AUTH SCHEMA ===================== */
+
+const UserSchema = new mongoose.Schema({
+  userId: { type: String, required: true, unique: true },
+  displayName: { type: String, default: "" },
+  password: { type: String, required: true },
+  avatarColor: { type: String, default: "#1E88E5" },
+  createdAt: { type: Number, default: Date.now },
+  lastLoginAt: Number,
+});
+
+const User = mongoose.model("User", UserSchema);
+
 /* ===================== MOCK RECOMMENDATION DATA ===================== */
 
 const recommendationData = {
@@ -384,6 +397,112 @@ app.get("/suggestions", (req, res) => {
 
   const suggestion = getRecommendation(destination);
   res.json(suggestion);
+});
+
+/* ===================== SIMPLE AUTH APIs ===================== */
+
+// POST /auth/signup
+app.post("/auth/signup", async (req, res) => {
+  try {
+    const { userId, displayName = "", password } = req.body;
+
+    if (!userId || !password) {
+      return res.status(400).json({
+        message: "userId and password are required",
+      });
+    }
+
+    const normalizedUserId = userId.trim();
+
+    const existingUser = await User.findOne({
+      userId: normalizedUserId,
+    });
+
+    if (existingUser) {
+      return res.status(409).json({
+        message: "User already exists",
+      });
+    }
+
+    const user = new User({
+      userId: normalizedUserId,
+      displayName: displayName || normalizedUserId,
+      password,
+      createdAt: Date.now(),
+    });
+
+    await user.save();
+
+    res.status(201).json({
+      message: "Signup successful",
+      user: {
+        userId: user.userId,
+        displayName: user.displayName,
+        avatarColor: user.avatarColor,
+        createdAt: user.createdAt,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({
+      message: err.message,
+    });
+  }
+});
+
+// POST /auth/login
+app.post("/auth/login", async (req, res) => {
+  try {
+    const { userId, password } = req.body;
+
+    if (!userId || !password) {
+      return res.status(400).json({
+        message: "userId and password are required",
+      });
+    }
+
+    const user = await User.findOne({
+      userId: userId.trim(),
+    });
+
+    if (!user || user.password !== password) {
+      return res.status(401).json({
+        message: "Invalid userId or password",
+      });
+    }
+
+    user.lastLoginAt = Date.now();
+    await user.save();
+
+    res.json({
+      message: "Login successful",
+      user: {
+        userId: user.userId,
+        displayName: user.displayName,
+        avatarColor: user.avatarColor,
+        createdAt: user.createdAt,
+        lastLoginAt: user.lastLoginAt,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({
+      message: err.message,
+    });
+  }
+});
+
+// GET /users
+app.get("/users", async (req, res) => {
+  try {
+    const users = await User.find()
+      .select("userId displayName avatarColor createdAt lastLoginAt")
+      .sort({ createdAt: -1 });
+
+    res.json(users);
+  } catch (err) {
+    res.status(500).json({
+      message: err.message,
+    });
+  }
 });
 
 /* ===================== TRIP APIs ===================== */
