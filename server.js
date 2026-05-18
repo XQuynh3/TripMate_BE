@@ -10,9 +10,14 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const MONGODB_URI =
-  process.env.MONGODB_URI ||
-  "mongodb+srv://tripmate_admin:tripmate2004@tripmatecluster.kj4xrqy.mongodb.net/?appName=TripMateCluster";
+const MONGODB_URI = process.env.MONGODB_URI;
+
+if (!MONGODB_URI) {
+  console.error(
+    "Missing MONGODB_URI. Please set it in .env or Render Environment Variables."
+  );
+  process.exit(1);
+}
 
 /* ===================== MONGODB CONNECT ===================== */
 
@@ -33,7 +38,7 @@ mongoose
 const ChecklistItemSchema = new mongoose.Schema(
   {
     text: { type: String, required: true },
-    category: { type: String, default: "General" }, // Shopping | Transport | Hotel | Personal | Food
+    category: { type: String, default: "General" },
     done: { type: Boolean, default: false },
     assignedTo: { type: String, default: "" },
     updatedBy: { type: String, default: "" },
@@ -45,7 +50,7 @@ const ChecklistItemSchema = new mongoose.Schema(
 const PlaceSchema = new mongoose.Schema(
   {
     name: String,
-    type: String, // beach | food | landmark | cafe | hotel | transport | shopping
+    type: String,
     reason: String,
     estimatedCost: String,
     address: String,
@@ -97,7 +102,7 @@ const TripSchema = new mongoose.Schema({
   members: { type: [String], default: [] },
 
   note: { type: String, default: "" },
-  status: { type: String, default: "planning" }, // planning | ongoing | finished
+  status: { type: String, default: "planning" },
   tags: { type: [String], default: ["Travel"] },
 
   places: { type: [PlaceSchema], default: [] },
@@ -105,10 +110,8 @@ const TripSchema = new mongoose.Schema({
   checklist: { type: [ChecklistItemSchema], default: [] },
   ratings: { type: [RatingSchema], default: [] },
 
-  // New multiple location reminders
   locationReminders: { type: [LocationReminderSchema], default: [] },
 
-  // Legacy single location reminder - giữ lại cho app cũ không crash
   reminderTitle: String,
   latitude: Number,
   longitude: Number,
@@ -370,7 +373,6 @@ app.get("/health", (req, res) => {
 
 /* ===================== SUGGESTIONS API ===================== */
 
-// GET /suggestions?destination=Vũng Tàu
 app.get("/suggestions", (req, res) => {
   const destination = req.query.destination || "";
 
@@ -386,7 +388,6 @@ app.get("/suggestions", (req, res) => {
 
 /* ===================== TRIP APIs ===================== */
 
-// POST /trips/from-suggestion
 app.post("/trips/from-suggestion", async (req, res) => {
   try {
     const { destination, userId, title, memberIds = [], note = "" } = req.body;
@@ -429,7 +430,6 @@ app.post("/trips/from-suggestion", async (req, res) => {
   }
 });
 
-// GET /trips?userId=userA
 app.get("/trips", async (req, res) => {
   try {
     const userId = req.query.userId;
@@ -452,7 +452,6 @@ app.get("/trips", async (req, res) => {
   }
 });
 
-// GET /trips/:id
 app.get("/trips/:id", async (req, res) => {
   try {
     const trip = await Trip.findById(req.params.id);
@@ -471,7 +470,6 @@ app.get("/trips/:id", async (req, res) => {
   }
 });
 
-// PUT /trips/:id
 app.put("/trips/:id", async (req, res) => {
   try {
     const trip = await Trip.findByIdAndUpdate(
@@ -497,7 +495,6 @@ app.put("/trips/:id", async (req, res) => {
   }
 });
 
-// DELETE /trips/:id
 app.delete("/trips/:id", async (req, res) => {
   try {
     const deleted = await Trip.findByIdAndDelete(req.params.id);
@@ -521,7 +518,6 @@ app.delete("/trips/:id", async (req, res) => {
 
 /* ===================== MOCK SHARING API ===================== */
 
-// POST /trips/:id/share
 app.post("/trips/:id/share", async (req, res) => {
   try {
     const { targetUserId, fromUserId } = req.body;
@@ -561,7 +557,6 @@ app.post("/trips/:id/share", async (req, res) => {
 
 /* ===================== COLLABORATIVE CHECKLIST APIs ===================== */
 
-// POST /trips/:id/checklist
 app.post("/trips/:id/checklist", async (req, res) => {
   try {
     const { text, category = "General", assignedTo = "", userId = "" } = req.body;
@@ -601,7 +596,6 @@ app.post("/trips/:id/checklist", async (req, res) => {
   }
 });
 
-// PATCH /trips/:id/checklist/:itemId
 app.patch("/trips/:id/checklist/:itemId", async (req, res) => {
   try {
     const { done, assignedTo, userId = "" } = req.body;
@@ -641,7 +635,6 @@ app.patch("/trips/:id/checklist/:itemId", async (req, res) => {
   }
 });
 
-// DELETE /trips/:id/checklist/:itemId
 app.delete("/trips/:id/checklist/:itemId", async (req, res) => {
   try {
     const { userId = "" } = req.body;
@@ -679,13 +672,8 @@ app.delete("/trips/:id/checklist/:itemId", async (req, res) => {
 
 /* ============================================================
    LOCATION REMINDER APIs
-   Backend chỉ lưu dữ liệu reminder.
-   Android sẽ dùng Geofence + Notification để nhắc thật khi tới nơi.
    ============================================================ */
 
-/* ---------- Legacy single location reminder API ---------- */
-
-// PATCH /trips/:id/location-reminder
 app.patch("/trips/:id/location-reminder", async (req, res) => {
   try {
     const {
@@ -723,9 +711,6 @@ app.patch("/trips/:id/location-reminder", async (req, res) => {
   }
 });
 
-/* ---------- New multiple location reminders APIs ---------- */
-
-// POST /trips/:id/location-reminders
 app.post("/trips/:id/location-reminders", async (req, res) => {
   try {
     const {
@@ -786,7 +771,6 @@ app.post("/trips/:id/location-reminders", async (req, res) => {
   }
 });
 
-// GET /trips/:id/location-reminders
 app.get("/trips/:id/location-reminders", async (req, res) => {
   try {
     const trip = await Trip.findById(req.params.id);
@@ -805,8 +789,6 @@ app.get("/trips/:id/location-reminders", async (req, res) => {
   }
 });
 
-// GET /users/:userId/location-reminders
-// Android gọi API này khi mở app để lấy reminder chưa trigger và đăng ký Geofence.
 app.get("/users/:userId/location-reminders", async (req, res) => {
   try {
     const userId = req.params.userId;
@@ -838,7 +820,6 @@ app.get("/users/:userId/location-reminders", async (req, res) => {
   }
 });
 
-// PATCH /trips/:id/location-reminders/:reminderId
 app.patch("/trips/:id/location-reminders/:reminderId", async (req, res) => {
   try {
     const {
@@ -895,8 +876,6 @@ app.patch("/trips/:id/location-reminders/:reminderId", async (req, res) => {
   }
 });
 
-// PATCH /trips/:id/location-reminders/:reminderId/trigger
-// Android gọi API này sau khi Geofence phát hiện user đã tới nơi và app đã show notification.
 app.patch("/trips/:id/location-reminders/:reminderId/trigger", async (req, res) => {
   try {
     const { userId = "" } = req.body;
@@ -939,8 +918,6 @@ app.patch("/trips/:id/location-reminders/:reminderId/trigger", async (req, res) 
   }
 });
 
-// PATCH /trips/:id/location-reminders/:reminderId/reset
-// Dùng để demo lại: triggered đổi về false.
 app.patch("/trips/:id/location-reminders/:reminderId/reset", async (req, res) => {
   try {
     const { userId = "" } = req.body;
@@ -984,7 +961,6 @@ app.patch("/trips/:id/location-reminders/:reminderId/reset", async (req, res) =>
   }
 });
 
-// DELETE /trips/:id/location-reminders/:reminderId
 app.delete("/trips/:id/location-reminders/:reminderId", async (req, res) => {
   try {
     const { userId = "" } = req.body;
@@ -1025,7 +1001,6 @@ app.delete("/trips/:id/location-reminders/:reminderId", async (req, res) => {
 
 /* ===================== RATINGS / DATA COLLECTION APIs ===================== */
 
-// POST /trips/:id/ratings
 app.post("/trips/:id/ratings", async (req, res) => {
   try {
     const { placeName, userId, score, comment = "" } = req.body;
@@ -1066,7 +1041,6 @@ app.post("/trips/:id/ratings", async (req, res) => {
   }
 });
 
-// GET /ratings/summary
 app.get("/ratings/summary", async (req, res) => {
   try {
     const result = await Trip.aggregate([
@@ -1096,10 +1070,7 @@ app.get("/ratings/summary", async (req, res) => {
 
 /* ============================================================
    LEGACY NOTE APP APIs
-   Giữ lại để app cũ không bị crash
    ============================================================ */
-
-/* ===================== NOTE ===================== */
 
 const NoteSchema = new mongoose.Schema({
   title: String,
@@ -1118,21 +1089,16 @@ const NoteSchema = new mongoose.Schema({
 
 const Note = mongoose.model("Note", NoteSchema);
 
-/* ===================== SHARE REQUEST ===================== */
-
 const ShareRequestSchema = new mongoose.Schema({
   noteId: String,
   fromUserId: String,
   toUserId: String,
-  status: { type: String, default: "pending" }, // pending | accepted | rejected
+  status: { type: String, default: "pending" },
   createdAt: { type: Number, default: Date.now },
 });
 
 const ShareRequest = mongoose.model("ShareRequest", ShareRequestSchema);
 
-/* ===================== NOTE APIs ===================== */
-
-// GET /notes?userId=userA
 app.get("/notes", async (req, res) => {
   try {
     const userId = req.query.userId;
@@ -1155,7 +1121,6 @@ app.get("/notes", async (req, res) => {
   }
 });
 
-// POST /notes
 app.post("/notes", async (req, res) => {
   try {
     const note = new Note({
@@ -1173,7 +1138,6 @@ app.post("/notes", async (req, res) => {
   }
 });
 
-// PUT /notes/:id
 app.put("/notes/:id", async (req, res) => {
   try {
     const note = await Note.findByIdAndUpdate(
@@ -1199,7 +1163,6 @@ app.put("/notes/:id", async (req, res) => {
   }
 });
 
-// DELETE /notes/:id
 app.delete("/notes/:id", async (req, res) => {
   try {
     const deleted = await Note.findByIdAndDelete(req.params.id);
@@ -1221,9 +1184,6 @@ app.delete("/notes/:id", async (req, res) => {
   }
 });
 
-/* ===================== SHARE REQUEST APIs ===================== */
-
-// POST /share-request
 app.post("/share-request", async (req, res) => {
   try {
     const { noteId, fromUserId, toUserId } = req.body;
@@ -1255,7 +1215,6 @@ app.post("/share-request", async (req, res) => {
   }
 });
 
-// GET /share-request?userId=userB
 app.get("/share-request", async (req, res) => {
   try {
     const userId = req.query.userId;
@@ -1279,7 +1238,6 @@ app.get("/share-request", async (req, res) => {
   }
 });
 
-// POST /share-request/accept
 app.post("/share-request/accept", async (req, res) => {
   try {
     const { requestId } = req.body;
@@ -1318,7 +1276,6 @@ app.post("/share-request/accept", async (req, res) => {
   }
 });
 
-// POST /share-request/reject
 app.post("/share-request/reject", async (req, res) => {
   try {
     const { requestId } = req.body;
