@@ -214,10 +214,28 @@ const PlaceSchema = new mongoose.Schema(
 
 const RatingSchema = new mongoose.Schema(
   {
-    placeName: String,
-    userId: String,
-    score: { type: Number, min: 1, max: 5 },
-    comment: String,
+    placeName: { type: String, required: true },
+    destination: { type: String, default: "" },
+
+    userId: { type: String, required: true },
+    score: { type: Number, min: 1, max: 5, required: true },
+    comment: { type: String, default: "" },
+
+    // Dataset source:
+    // location_reminder = user review sau khi arrived
+    // plan_done = user review sau khi hoàn thành plan item
+    // manual = fallback/demo
+    source: {
+      type: String,
+      default: "manual",
+      enum: ["location_reminder", "plan_done", "manual"],
+    },
+
+    reminderId: { type: String, default: "" },
+    checklistItemId: { type: String, default: "" },
+    planItemId: { type: String, default: "" },
+
+    tripStatusAtReview: { type: String, default: "" },
     createdAt: { type: Number, default: Date.now },
   },
   { _id: true }
@@ -295,7 +313,7 @@ const TripSchema = new mongoose.Schema({
   status: {
     type: String,
     default: "planning",
-    enum: ["planning", "ongoing", "finished", "cancelled"],
+    enum: ["planning", "finished", "cancelled"],
   },
 
   tags: { type: [String], default: ["Travel"] },
@@ -343,13 +361,24 @@ const User = mongoose.model("User", UserSchema);
 
 const TripShareRequestSchema = new mongoose.Schema({
   tripId: { type: String, required: true },
+
   fromUserId: { type: String, required: true },
   toUserId: { type: String, required: true },
+
+  type: {
+    type: String,
+    default: "join",
+    enum: ["join", "share"],
+  },
+
+  inviteCode: { type: String, default: "" },
+
   status: {
     type: String,
     default: "pending",
     enum: ["pending", "accepted", "rejected"],
   },
+
   message: { type: String, default: "" },
   createdAt: { type: Number, default: Date.now },
   updatedAt: { type: Number, default: Date.now },
@@ -878,7 +907,7 @@ app.put("/trips/:id", async (req, res) => {
       trip.members = uniqueStrings(members).filter((id) => id !== trip.ownerId);
     }
     if (status !== undefined) {
-      const allowedStatus = ["planning", "ongoing", "finished", "cancelled"];
+      const allowedStatus = ["planning", "finished", "cancelled"];
       if (!allowedStatus.includes(status)) {
         return res.status(400).json({
           message: "Invalid status",
@@ -1104,6 +1133,90 @@ app.delete("/trips/:id/categories/:categoryName", async (req, res) => {
 
 /* ===================== TRIP SHARING / INVITE ===================== */
 
+function buildTripRequestDTO(request, trip) {
+  return {
+    _id: request._id,
+    tripId: request.tripId,
+    tripTitle: trip ? trip.title : "",
+    destination: trip ? trip.destination : "",
+    fromUserId: request.fromUserId,
+    toUserId: request.toUserId,
+    type: request.type || "join",
+    inviteCode: request.inviteCode || "",
+    status: request.status,
+    message: request.message || "",
+    createdAt: request.createdAt,
+    updatedAt: request.updatedAt,
+  };
+}
+
+async function createJoinRequestByInviteCode({ inviteCode, userId, message = "" }) {
+  const cleanInviteCode = String(inviteCode || "").trim().toUpperCase();
+  const cleanUserId = normalizeUserId(userId);
+
+  if (!cleanInviteCode || !cleanUserId) {
+    const error = new Error("inviteCode and userId are required");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const trip = await Trip.findOne({
+    inviteCode: cleanInviteCode,
+  });
+
+  if (!trip) {
+    const error = new Error("Invalid invite code");
+    error.statusCode = 404;
+    throw error;
+  }
+
+  if (trip.ownerId === cleanUserId) {
+    const error = new Error("You are already the owner of this trip");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if ((trip.members || []).includes(cleanUserId)) {
+    const error = new Error("You are already a member of this trip");
+    error.statusCode = 409;
+    throw error;
+  }
+
+  const existingPending = await TripShareRequest.findOne({
+    tripId: String(trip._id),
+    fromUserId: cleanUserId,
+    toUserId: trip.ownerId,
+    type: "join",
+    status: "pending",
+  });
+
+  if (existingPending) {
+    const error = new Error("Join request already pending");
+    error.statusCode = 409;
+    error.request = existingPending;
+    throw error;
+  }
+
+  const request = new TripShareRequest({
+    tripId: String(trip._id),
+    fromUserId: cleanUserId,
+    toUserId: trip.ownerId,
+    type: "join",
+    inviteCode: trip.inviteCode,
+    status: "pending",
+    message: message || "",
+    createdAt: now(),
+    updatedAt: now(),
+  });
+
+  await request.save();
+
+  return {
+    request,
+    trip,
+  };
+}
+
 app.get("/trips/:id/invite-code", async (req, res) => {
   try {
     const trip = await Trip.findById(req.params.id);
@@ -1116,6 +1229,7 @@ app.get("/trips/:id/invite-code", async (req, res) => {
 
     if (!trip.inviteCode) {
       trip.inviteCode = await generateUniqueInviteCode();
+      trip.updatedAt = now();
       await trip.save();
     }
 
@@ -1130,44 +1244,68 @@ app.get("/trips/:id/invite-code", async (req, res) => {
   }
 });
 
-app.post("/trips/join-by-code", async (req, res) => {
+app.post("/trips/join-request", async (req, res) => {
   try {
-    const { inviteCode, userId } = req.body;
+    const { inviteCode, userId, message = "" } = req.body;
 
-    if (!inviteCode || !userId) {
-      return res.status(400).json({
-        message: "inviteCode and userId are required",
-      });
-    }
-
-    const trip = await Trip.findOne({
-      inviteCode: String(inviteCode).trim().toUpperCase(),
+    const { request, trip } = await createJoinRequestByInviteCode({
+      inviteCode,
+      userId,
+      message,
     });
 
-    if (!trip) {
-      return res.status(404).json({
-        message: "Invalid invite code",
-      });
-    }
-
-    if (trip.ownerId !== userId && !(trip.members || []).includes(userId)) {
-      trip.members.push(userId);
-      trip.updatedBy = userId;
-      trip.updatedAt = now();
-      await trip.save();
-    }
-
-    res.json({
-      message: "Joined trip successfully",
-      trip,
+    res.status(201).json({
+      message: "Join request sent",
+      request,
+      trip: {
+        _id: trip._id,
+        title: trip.title,
+        destination: trip.destination,
+        ownerId: trip.ownerId,
+      },
     });
   } catch (err) {
-    res.status(500).json({
+    res.status(err.statusCode || 500).json({
       message: err.message,
+      request: err.request,
     });
   }
 });
 
+// Backward compatible endpoint.
+// Trước đây endpoint này join thẳng.
+// Bây giờ đổi thành gửi join request để owner duyệt.
+app.post("/trips/join-by-code", async (req, res) => {
+  try {
+    const { inviteCode, userId, message = "" } = req.body;
+
+    const { request, trip } = await createJoinRequestByInviteCode({
+      inviteCode,
+      userId,
+      message,
+    });
+
+    res.status(201).json({
+      message: "Join request sent",
+      request,
+      trip: {
+        _id: trip._id,
+        title: trip.title,
+        destination: trip.destination,
+        ownerId: trip.ownerId,
+      },
+    });
+  } catch (err) {
+    res.status(err.statusCode || 500).json({
+      message: err.message,
+      request: err.request,
+    });
+  }
+});
+
+// Giữ endpoint share cũ để Android hiện tại không bị vỡ.
+// Endpoint này vẫn add member trực tiếp.
+// Sau này nếu muốn production hơn thì đổi share thành request giống join.
 app.post("/trips/:id/share", async (req, res) => {
   try {
     const { targetUserId, fromUserId } = req.body;
@@ -1188,7 +1326,13 @@ app.post("/trips/:id/share", async (req, res) => {
 
     const cleanTarget = normalizeUserId(targetUserId);
 
-    if (cleanTarget !== trip.ownerId && !(trip.members || []).includes(cleanTarget)) {
+    if (cleanTarget === trip.ownerId) {
+      return res.status(400).json({
+        message: "Target user is already the owner",
+      });
+    }
+
+    if (!trip.members.includes(cleanTarget)) {
       trip.members.push(cleanTarget);
     }
 
@@ -1208,8 +1352,194 @@ app.post("/trips/:id/share", async (req, res) => {
   }
 });
 
-/* ===================== TRIP SHARE REQUEST APIs ===================== */
+/* ===================== TRIP REQUEST APIs ===================== */
 
+// API mới cho Android dùng.
+// Trả cả request owner cần duyệt và request user đã gửi.
+app.get("/trip-requests", async (req, res) => {
+  try {
+    const userId = normalizeUserId(req.query.userId);
+    const status = req.query.status;
+
+    if (!userId) {
+      return res.status(400).json({
+        message: "userId is required",
+      });
+    }
+
+    const ownerQuery = {
+      toUserId: userId,
+    };
+
+    const myQuery = {
+      fromUserId: userId,
+    };
+
+    if (status) {
+      ownerQuery.status = status;
+      myQuery.status = status;
+    }
+
+    const ownerRequestsRaw = await TripShareRequest.find(ownerQuery).sort({
+      createdAt: -1,
+    });
+
+    const myRequestsRaw = await TripShareRequest.find(myQuery).sort({
+      createdAt: -1,
+    });
+
+    const allTripIds = uniqueStrings([
+      ...ownerRequestsRaw.map((r) => r.tripId),
+      ...myRequestsRaw.map((r) => r.tripId),
+    ]);
+
+    const trips = await Trip.find({
+      _id: { $in: allTripIds },
+    });
+
+    const tripMap = {};
+    trips.forEach((trip) => {
+      tripMap[String(trip._id)] = trip;
+    });
+
+    const ownerRequests = ownerRequestsRaw.map((request) =>
+      buildTripRequestDTO(request, tripMap[request.tripId])
+    );
+
+    const myRequests = myRequestsRaw.map((request) =>
+      buildTripRequestDTO(request, tripMap[request.tripId])
+    );
+
+    res.json({
+      ownerRequests,
+      myRequests,
+    });
+  } catch (err) {
+    res.status(500).json({
+      message: err.message,
+    });
+  }
+});
+
+app.post("/trip-requests/:requestId/accept", async (req, res) => {
+  try {
+    const { ownerId } = req.body;
+
+    if (!ownerId) {
+      return res.status(400).json({
+        message: "ownerId is required",
+      });
+    }
+
+    const request = await TripShareRequest.findById(req.params.requestId);
+
+    if (!request) {
+      return res.status(404).json({
+        message: "Trip request not found",
+      });
+    }
+
+    if (request.toUserId !== ownerId) {
+      return res.status(403).json({
+        message: "Only owner can accept this request",
+      });
+    }
+
+    if (request.status !== "pending") {
+      return res.status(400).json({
+        message: `Request is already ${request.status}`,
+      });
+    }
+
+    const trip = await Trip.findById(request.tripId);
+
+    if (!trip) {
+      return res.status(404).json({
+        message: "Trip not found",
+      });
+    }
+
+    if (trip.ownerId !== ownerId) {
+      return res.status(403).json({
+        message: "Only trip owner can accept this request",
+      });
+    }
+
+    if (request.fromUserId !== trip.ownerId && !trip.members.includes(request.fromUserId)) {
+      trip.members.push(request.fromUserId);
+    }
+
+    trip.updatedBy = ownerId;
+    trip.updatedAt = now();
+
+    request.status = "accepted";
+    request.updatedAt = now();
+
+    await trip.save();
+    await request.save();
+
+    res.json({
+      message: "Join request accepted",
+      request,
+      trip,
+    });
+  } catch (err) {
+    res.status(500).json({
+      message: err.message,
+    });
+  }
+});
+
+app.post("/trip-requests/:requestId/reject", async (req, res) => {
+  try {
+    const { ownerId } = req.body;
+
+    if (!ownerId) {
+      return res.status(400).json({
+        message: "ownerId is required",
+      });
+    }
+
+    const request = await TripShareRequest.findById(req.params.requestId);
+
+    if (!request) {
+      return res.status(404).json({
+        message: "Trip request not found",
+      });
+    }
+
+    if (request.toUserId !== ownerId) {
+      return res.status(403).json({
+        message: "Only owner can reject this request",
+      });
+    }
+
+    if (request.status !== "pending") {
+      return res.status(400).json({
+        message: `Request is already ${request.status}`,
+      });
+    }
+
+    request.status = "rejected";
+    request.updatedAt = now();
+
+    await request.save();
+
+    res.json({
+      message: "Join request rejected",
+      request,
+    });
+  } catch (err) {
+    res.status(500).json({
+      message: err.message,
+    });
+  }
+});
+
+/* ===================== LEGACY TRIP SHARE REQUEST APIs ===================== */
+
+// Giữ lại endpoint cũ để không làm vỡ code cũ.
+// Có thể dùng cho direct share request nếu cần.
 app.post("/trip-share-request", async (req, res) => {
   try {
     const { tripId, fromUserId, toUserId, message = "" } = req.body;
@@ -1232,6 +1562,7 @@ app.post("/trip-share-request", async (req, res) => {
       tripId,
       fromUserId,
       toUserId,
+      type: "share",
       status: "pending",
     });
 
@@ -1246,6 +1577,8 @@ app.post("/trip-share-request", async (req, res) => {
       tripId,
       fromUserId,
       toUserId,
+      type: "share",
+      inviteCode: trip.inviteCode || "",
       message,
       status: "pending",
       createdAt: now(),
@@ -1315,7 +1648,7 @@ app.post("/trip-share-request/accept", async (req, res) => {
       });
     }
 
-    if (trip.ownerId !== request.toUserId && !trip.members.includes(request.toUserId)) {
+    if (request.toUserId !== trip.ownerId && !trip.members.includes(request.toUserId)) {
       trip.members.push(request.toUserId);
     }
 
@@ -2288,6 +2621,16 @@ app.patch("/trips/:id/location-reminders/:reminderId/trigger", async (req, res) 
       message: "Location reminder triggered",
       reminder,
       trip,
+
+      // Android dùng phần này để hỏi user review ngay sau khi arrived
+      reviewPrompt: {
+        shouldAskReview: true,
+        placeName: reminder.locationName || reminder.title,
+        destination: trip.destination,
+        source: "location_reminder",
+        reminderId: String(reminder._id),
+        checklistItemId: reminder.checklistItemId || "",
+      },
     });
   } catch (err) {
     res.status(500).json({
@@ -2391,7 +2734,16 @@ app.delete("/trips/:id/location-reminders/:reminderId", async (req, res) => {
 
 app.post("/trips/:id/ratings", async (req, res) => {
   try {
-    const { placeName, userId, score, comment = "" } = req.body;
+    const {
+      placeName,
+      userId,
+      score,
+      comment = "",
+      source = "manual",
+      reminderId = "",
+      checklistItemId = "",
+      planItemId = "",
+    } = req.body;
 
     if (!placeName || !userId || !score) {
       return res.status(400).json({
@@ -2415,17 +2767,95 @@ app.post("/trips/:id/ratings", async (req, res) => {
       });
     }
 
-    if (trip.status !== "finished") {
-      return res.status(400).json({
-        message: "Trip must be finished before rating",
+    const cleanSource = ["location_reminder", "plan_done", "manual"].includes(source)
+      ? source
+      : "manual";
+
+    let finalChecklistItemId = normalizeText(checklistItemId);
+    let finalPlanItemId = normalizeText(planItemId);
+    let finalReminderId = normalizeText(reminderId);
+
+    // Nếu review từ location reminder thì bắt buộc reminder phải tồn tại và đã triggered.
+    // Như vậy data review sạch hơn, không phải review khơi khơi.
+    if (cleanSource === "location_reminder") {
+      if (!finalReminderId) {
+        return res.status(400).json({
+          message: "reminderId is required for location_reminder rating",
+        });
+      }
+
+      const reminder = trip.locationReminders.id(finalReminderId);
+
+      if (!reminder) {
+        return res.status(404).json({
+          message: "Location reminder not found",
+        });
+      }
+
+      if (!reminder.triggered) {
+        return res.status(400).json({
+          message: "You can only review after arriving at this location",
+        });
+      }
+
+      finalChecklistItemId = finalChecklistItemId || reminder.checklistItemId || "";
+    }
+
+    // Nếu sau này Plan Maker gọi source=plan_done thì nên check plan item đã done.
+    if (cleanSource === "plan_done") {
+      if (!finalPlanItemId) {
+        return res.status(400).json({
+          message: "planItemId is required for plan_done rating",
+        });
+      }
+
+      const planItem = trip.planItems.id(finalPlanItemId);
+
+      if (!planItem) {
+        return res.status(404).json({
+          message: "Plan item not found",
+        });
+      }
+
+      if (!planItem.done) {
+        return res.status(400).json({
+          message: "You can only review after completing this plan item",
+        });
+      }
+    }
+
+    // Chặn user review trùng cùng 1 reminder / plan item để dataset không bị spam.
+    const alreadyReviewed = (trip.ratings || []).some((rating) => {
+      const sameUser = rating.userId === userId;
+
+      if (cleanSource === "location_reminder") {
+        return sameUser && rating.reminderId === finalReminderId;
+      }
+
+      if (cleanSource === "plan_done") {
+        return sameUser && rating.planItemId === finalPlanItemId;
+      }
+
+      return false;
+    });
+
+    if (alreadyReviewed) {
+      return res.status(409).json({
+        message: "You already reviewed this item",
       });
     }
 
     trip.ratings.push({
-      placeName,
-      userId,
+      placeName: normalizeText(placeName),
+      destination: trip.destination,
+      userId: normalizeUserId(userId),
       score: numericScore,
-      comment,
+      comment: normalizeText(comment),
+      source: cleanSource,
+      reminderId: finalReminderId,
+      checklistItemId: finalChecklistItemId,
+      planItemId: finalPlanItemId,
+      tripStatusAtReview: trip.status || "",
       createdAt: now(),
     });
 
@@ -2434,13 +2864,18 @@ app.post("/trips/:id/ratings", async (req, res) => {
 
     await trip.save();
 
-    res.status(201).json(trip);
+    res.status(201).json({
+      message: "Rating submitted",
+      trip,
+      rating: trip.ratings[trip.ratings.length - 1],
+    });
   } catch (err) {
     res.status(500).json({
       message: err.message,
     });
   }
 });
+
 
 app.get("/ratings/summary", async (req, res) => {
   try {
@@ -2467,6 +2902,12 @@ app.get("/ratings/summary", async (req, res) => {
               userId: "$ratings.userId",
               comment: "$ratings.comment",
               score: "$ratings.score",
+              source: "$ratings.source",
+              destination: "$ratings.destination",
+              reminderId: "$ratings.reminderId",
+              checklistItemId: "$ratings.checklistItemId",
+              planItemId: "$ratings.planItemId",
+              tripStatusAtReview: "$ratings.tripStatusAtReview",
               createdAt: "$ratings.createdAt",
             },
           },
