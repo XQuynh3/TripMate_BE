@@ -173,6 +173,33 @@ function buildChecklistItem({
   };
 }
 
+/* ===================== SEARCH HELPERS ===================== */
+
+function removeVietnameseTones(str = "") {
+  return String(str)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/đ/g, "d")
+    .replace(/Đ/g, "D")
+    .toLowerCase()
+    .trim();
+}
+
+function searchMatch(name, query) {
+  const n = removeVietnameseTones(name);
+  const q = removeVietnameseTones(query);
+  return n.includes(q);
+}
+
+function searchScore(name, query) {
+  const n = removeVietnameseTones(name);
+  const q = removeVietnameseTones(query);
+  if (n === q) return 0;
+  if (n.startsWith(q)) return 1;
+  if (n.includes(q)) return 2;
+  return 99;
+}
+
 /* ===================== SCHEMAS ===================== */
 
 const ChecklistItemSchema = new mongoose.Schema(
@@ -220,6 +247,7 @@ const RatingSchema = new mongoose.Schema(
     userId: { type: String, required: true },
     score: { type: Number, min: 1, max: 5, required: true },
     comment: { type: String, default: "" },
+    imageUrls: { type: [String], default: [] },
 
     // Dataset source:
     // location_reminder = user review sau khi arrived
@@ -649,6 +677,130 @@ app.get("/suggestions", (req, res) => {
 
   const suggestion = getRecommendation(destination);
   res.json(suggestion);
+});
+
+/* ===================== SEARCH API ===================== */
+
+app.get("/search", async (req, res) => {
+  try {
+    const q = normalizeText(req.query.q);
+
+    if (!q || q.length < 1) {
+      return res.json([]);
+    }
+
+    const results = [];
+
+    // Scan recommendationData
+    for (const key of Object.keys(recommendationData)) {
+      const suggestion = recommendationData[key];
+      const destination = suggestion.destination;
+
+      // Destination match
+      if (searchMatch(destination, q)) {
+        results.push({
+          type: "destination",
+          name: destination,
+          destination,
+          subtitle: "Smart suggestion destination",
+          estimatedCost: "",
+          reason: suggestion.intro || "",
+          ratingAverage: 0,
+          ratingCount: 0,
+          score: searchScore(destination, q),
+        });
+      }
+
+      // Places match
+      for (const place of suggestion.places || []) {
+        if (searchMatch(place.name, q)) {
+          results.push({
+            type: "place",
+            name: place.name,
+            destination,
+            subtitle: `${place.type || "place"} · ${destination}`,
+            estimatedCost: place.estimatedCost || "",
+            reason: place.reason || "",
+            ratingAverage: 0,
+            ratingCount: 0,
+            score: searchScore(place.name, q),
+          });
+        }
+      }
+
+      // Foods match
+      for (const food of suggestion.foods || []) {
+        if (searchMatch(food.name, q)) {
+          results.push({
+            type: "food",
+            name: food.name,
+            destination,
+            subtitle: `food · ${destination}`,
+            estimatedCost: food.estimatedCost || "",
+            reason: food.reason || "",
+            ratingAverage: 0,
+            ratingCount: 0,
+            score: searchScore(food.name, q),
+          });
+        }
+      }
+    }
+
+    // Deduplicate by name+type
+    const seen = new Set();
+    const deduped = [];
+    for (const item of results) {
+      const key = `${item.type}:${item.name}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        deduped.push(item);
+      }
+    }
+
+    // Sort: exact match > startsWith > contains
+    deduped.sort((a, b) => a.score - b.score);
+
+    // Fetch ratings from all trips
+    const allNames = deduped.map((r) => r.name);
+    let ratingMap = {};
+    if (allNames.length > 0) {
+      const agg = await Trip.aggregate([
+        { $unwind: "$ratings" },
+        { $match: { "ratings.placeName": { $in: allNames } } },
+        {
+          $group: {
+            _id: "$ratings.placeName",
+            averageScore: { $avg: "$ratings.score" },
+            totalReviews: { $sum: 1 },
+          },
+        },
+      ]);
+      for (const item of agg) {
+        ratingMap[item._id] = {
+          averageScore: item.averageScore,
+          totalReviews: item.totalReviews,
+        };
+      }
+    }
+
+    const enriched = deduped.map((item) => {
+      const r = ratingMap[item.name];
+      return {
+        type: item.type,
+        name: item.name,
+        destination: item.destination,
+        subtitle: item.subtitle,
+        estimatedCost: item.estimatedCost,
+        reason: item.reason,
+        ratingAverage: r ? parseFloat(r.averageScore.toFixed(1)) : 0,
+        ratingCount: r ? r.totalReviews : 0,
+      };
+    });
+
+    res.json(enriched.slice(0, 10));
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
 });
 
 /* ===================== SIMPLE AUTH APIs ===================== */
@@ -2739,6 +2891,7 @@ app.post("/trips/:id/ratings", async (req, res) => {
       userId,
       score,
       comment = "",
+      imageUrls = [],
       source = "manual",
       reminderId = "",
       checklistItemId = "",
@@ -2851,6 +3004,7 @@ app.post("/trips/:id/ratings", async (req, res) => {
       userId: normalizeUserId(userId),
       score: numericScore,
       comment: normalizeText(comment),
+      imageUrls: Array.isArray(imageUrls) ? imageUrls : [],
       source: cleanSource,
       reminderId: finalReminderId,
       checklistItemId: finalChecklistItemId,
@@ -2928,6 +3082,93 @@ app.get("/ratings/summary", async (req, res) => {
     res.status(500).json({
       message: err.message,
     });
+  }
+});
+
+app.get("/reviews/place", async (req, res) => {
+  try {
+    const placeName = normalizeText(req.query.placeName);
+
+    if (!placeName) {
+      return res.status(400).json({
+        message: "placeName is required",
+      });
+    }
+
+    // Aggregate all ratings matching placeName across all trips
+    const pipeline = [
+      { $unwind: "$ratings" },
+      { $match: { "ratings.placeName": placeName } },
+      {
+        $group: {
+          _id: "$ratings.placeName",
+          averageScore: { $avg: "$ratings.score" },
+          totalReviews: { $sum: 1 },
+          rawReviews: {
+            $push: {
+              userId: "$ratings.userId",
+              score: "$ratings.score",
+              comment: "$ratings.comment",
+              source: "$ratings.source",
+              destination: "$ratings.destination",
+              tripStatusAtReview: "$ratings.tripStatusAtReview",
+              imageUrls: "$ratings.imageUrls",
+              createdAt: "$ratings.createdAt",
+            },
+          },
+        },
+      },
+    ];
+
+    const aggResult = await Trip.aggregate(pipeline);
+    const match = aggResult[0];
+
+    if (!match) {
+      return res.json({
+        placeName,
+        averageScore: 0,
+        totalReviews: 0,
+        reviews: [],
+      });
+    }
+
+    // Join user info
+    const userIds = [...new Set(match.rawReviews.map((r) => r.userId))];
+    const users = await User.find({ userId: { $in: userIds } })
+      .select("userId displayName avatarColor")
+      .lean();
+
+    const userMap = {};
+    for (const u of users) {
+      userMap[u.userId] = u;
+    }
+
+    const reviews = match.rawReviews
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+      .map((r) => {
+        const u = userMap[r.userId] || {};
+        return {
+          userId: r.userId,
+          displayName: u.displayName || r.userId,
+          avatarColor: u.avatarColor || "#1E88E5",
+          score: r.score,
+          comment: r.comment,
+          source: r.source,
+          destination: r.destination,
+          tripStatusAtReview: r.tripStatusAtReview,
+          imageUrls: r.imageUrls || [],
+          createdAt: r.createdAt,
+        };
+      });
+
+    res.json({
+      placeName,
+      averageScore: parseFloat(match.averageScore.toFixed(1)),
+      totalReviews: match.totalReviews,
+      reviews,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
   }
 });
 
